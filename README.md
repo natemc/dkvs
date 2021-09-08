@@ -1,2 +1,2 @@
 # dkvs
-Exercises for Bradfield Distributed Systems Course
+Exercises for the Bradfield Distributed Systems Course.
