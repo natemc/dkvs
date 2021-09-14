@@ -13,11 +13,47 @@
 #include <system_error>
 #include <type_traits>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #define SYSTEM_ERROR(context) \
     std::system_error(errno, std::generic_category(), #context)
+
+using KV = std::unordered_map<std::string, std::string>;
+
+#define BAIL(CAT, DATA) \
+    do { std::cout << CAT << ": " << DATA << '\n'; return; } while (false);
+
+void process_command(const char* command, KV& kv) {
+    const char* const end = command + strlen(command);
+    if (std::distance(command, end) < 5) {
+        std::cout << "Invalid command: " << command << '\n';
+    } else {
+        const char* const sp = std::find(command, end, ' ');
+        if (sp == end) {
+            std::cout << "Invalid command: " << command << '\n';
+        } else if (std::equal(command, sp, "get")) {
+            const char* const key = sp + 1;
+            const auto it = kv.find(key);
+            if (it != kv.end()) {
+                std::cout << it->second << '\n';
+            } else {
+                std::cout << key << " is not bound.\n";
+            }
+        } else if (std::equal(command, sp, "set")) {
+            const char* const eq = std::find(sp + 1, end, '=');
+            if (eq == end || eq == sp + 1) {
+                std::cout << "Invalid command: " << command << '\n';
+            } else {
+                const std::string key(sp + 1, eq);
+                kv[key] = eq + 1;
+            }
+        } else {
+            std::cout << "Invalid command: " << command << '\n';
+        }
+    }
+}
 
 #ifdef __APPLE__
 
@@ -71,7 +107,7 @@ int KQueue::operator()() {
     else                                     return num_triggered;
 }
 
-void repl(int signal_pipe) {
+void repl(int signal_pipe, KV& kv) {
     KQueue q{fileno(stdin), signal_pipe};
     char buf[4096];
     char* p = buf;
@@ -84,7 +120,7 @@ void repl(int signal_pipe) {
             for (int i = 0; i < nev; ++i) {
                 if (q[i].flags & EV_ERROR)
                     throw std::runtime_error(strerror(int(q[i].data)));
-                if (q[i].ident == uintptr_t(signal_pipe[0])) {
+                if (q[i].ident == uintptr_t(signal_pipe)) {
                     done = true;
                     break;
                 }
@@ -99,7 +135,7 @@ void repl(int signal_pipe) {
                         if (p == std::end(buf)) throw std::runtime_error("OOM");
                     } else {
                         *nl = '\0';
-                        std::cout << buf << '\n';
+                        process_command(buf, kv);
                         std::copy_backward(nl + 1, p + bytes_read, buf);
                         p = buf + (p + bytes_read - nl - 1);
                         std::cout << "> " << std::flush;
@@ -172,7 +208,7 @@ io_uring_cqe* IOURing::wait() {
     return cqe;
 }
 
-void repl(int signal_pipe) {
+void repl(int signal_pipe, KV& kv) {
     char buf[4096], pipe_buf[4096];
     char* p = buf;
     const auto space_left = [&](){ return uint32_t(std::end(buf) - p); };
@@ -201,7 +237,7 @@ void repl(int signal_pipe) {
                 if (p == std::end(buf)) throw std::runtime_error("OOM");
             } else {
                 *nl = '\0';
-                std::cout << buf << '\n';
+                process_command(buf, kv);
                 std::copy_backward(nl + 1, p + bytes_read, buf);
                 p = buf + (p + bytes_read - nl - 1);
                 ring.prep_read(fileno(stdin), p, space_left());
@@ -252,7 +288,10 @@ int main() {
 
         const auto signal_rc = signal(SIGINT, signal_handler);
         if (signal_rc == SIG_ERR) throw SYSTEM_ERROR(signal);
-        repl(signal_pipe[0]);
+
+        KV kv;
+        repl(signal_pipe[0], kv);
+
         std::cout << "bye!\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
