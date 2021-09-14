@@ -23,6 +23,21 @@
 
 using KV = std::unordered_map<std::string, std::string>;
 
+std::vector<uint8_t> serialize(const KV& kv) {
+    std::vector<uint8_t> r;
+    for (const auto& [k, v]: kv) {
+        assert(k.size() < 256);
+        assert(v.size() < 256);
+        r.push_back(uint8_t(k.size()));
+        std::transform(k.begin(), k.end(), std::back_inserter(r),
+                       [](char c){ return uint8_t(c); });
+        r.push_back(uint8_t(v.size()));
+        std::transform(v.begin(), v.end(), std::back_inserter(r),
+                       [](char c){ return uint8_t(c); });
+    }
+    return r;
+}
+
 #define BAIL(CAT, DATA) \
     do { std::cout << CAT << ": " << DATA << '\n'; return; } while (false);
 
@@ -58,6 +73,7 @@ void process_command(const char* command, KV& kv) {
 
 #ifdef __APPLE__
 
+#include <fstream>
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -108,6 +124,16 @@ int KQueue::operator()() {
     else                                     return num_triggered;
 }
 
+void save_snapshot(const KV& kv) {
+    const auto s = serialize(kv);
+    std::fstream f;
+    f.open("snapshot", f.app | f.binary | f.in | f.out);
+    if (!f.is_open()) throw SYSTEM_ERROR("snapshot");
+    for (auto c: s) f << c;
+    f.close();
+
+}
+
 void repl(int signal_pipe, KV& kv) {
     KQueue q{fileno(stdin), signal_pipe};
     char buf[4096];
@@ -137,6 +163,7 @@ void repl(int signal_pipe, KV& kv) {
                     } else {
                         *nl = '\0';
                         process_command(buf, kv);
+                        save_snapshot(kv);
                         std::copy_backward(nl + 1, p + bytes_read, buf);
                         p = buf + (p + bytes_read - nl - 1);
                         std::cout << "> " << std::flush;
@@ -239,6 +266,11 @@ void repl(int signal_pipe, KV& kv) {
             } else {
                 *nl = '\0';
                 process_command(buf, kv);
+                std::vector<uint8_t> s = serialize(kv);
+                ring.prep_open();
+                ring.prep_write();
+                ring.prep_fsync(); // redundant due to close?
+                ring.prep_close();
                 std::copy_backward(nl + 1, p + bytes_read, buf);
                 p = buf + (p + bytes_read - nl - 1);
                 ring.prep_read(fileno(stdin), p, space_left());
