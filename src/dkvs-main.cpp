@@ -3,6 +3,7 @@
 #include <cassert>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <dkvs.h>
 #include <fcntl.h>
 #include <initializer_list>
