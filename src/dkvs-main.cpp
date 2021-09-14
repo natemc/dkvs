@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <dkvs.h>
+#include <fcntl.h>
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
@@ -15,23 +16,25 @@
 #include <utility>
 #include <vector>
 
-#define SYSTEM_ERROR(context) std::system_error(errno, std::generic_category(), #context)
+#define SYSTEM_ERROR(context) \
+    std::system_error(errno, std::generic_category(), #context)
 
 #ifdef __APPLE__
+
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/types.h>
 
-struct IOQueue {
+struct KQueue {
     template <class I>
     requires(std::is_same_v<int, std::decay_t<decltype(*std::declval<I>())>>)
-    IOQueue(I first, I last);
-    IOQueue(std::initializer_list<int> fds): IOQueue(fds.begin(), fds.end()) {}
-    ~IOQueue() { if (0 <= kq) close(kq); }
-    IOQueue(IOQueue&& o) noexcept: kq(o.kq) { o.kq = -1; }
-    IOQueue& operator=(IOQueue&& o) noexcept;
-    IOQueue(const IOQueue&) = delete;
-    IOQueue& operator=(const IOQueue&) = delete;
+    KQueue(I first, I last);
+    KQueue(std::initializer_list<int> fds): KQueue(fds.begin(), fds.end()) {}
+    ~KQueue() { if (0 <= kq) close(kq); }
+    KQueue(KQueue&& o) noexcept: kq(o.kq) { o.kq = -1; }
+    KQueue& operator=(KQueue&& o) noexcept;
+    KQueue(const KQueue&) = delete;
+    KQueue& operator=(const KQueue&) = delete;
 
     int operator()();
     const struct kevent& operator[](int i) { return events[std::size_t(i)]; }
@@ -43,7 +46,7 @@ private:
 
 template <class I>
 requires(std::is_same_v<int, std::decay_t<decltype(*std::declval<I>())>>)
-IOQueue::IOQueue(I first, I last): kq(kqueue()) {
+KQueue::KQueue(I first, I last): kq(kqueue()) {
     if (kq == -1) throw SYSTEM_ERROR(kqueue);
     const std::size_t n = std::size_t(std::distance(first, last));
     events.resize(n);
@@ -53,29 +56,175 @@ IOQueue::IOQueue(I first, I last): kq(kqueue()) {
         throw SYSTEM_ERROR(kevent);
 }
 
-IOQueue& IOQueue::operator=(IOQueue&& o) noexcept {
-    IOQueue x(std::move(o));
-    std::swap(*this, x);
+KQueue& KQueue::operator=(KQueue&& o) noexcept {
+    KQueue x(std::move(o));
+    using std::swap;
+    swap(*this, x);
     return *this;
 }
 
-int IOQueue::operator()() {
+int KQueue::operator()() {
     assert(0 <= kq);
     const int num_triggered = kevent(kq, nullptr, 0,
         events.data(), int(events.size()), nullptr);
     if (num_triggered < 0 && errno != EINTR) throw SYSTEM_ERROR(kevent);
     else                                     return num_triggered;
 }
+
+void repl(int signal_pipe) {
+    KQueue q{fileno(stdin), signal_pipe};
+    char buf[4096];
+    char* p = buf;
+    const auto space_left = [&](){ return std::size_t(std::end(buf) - p); };
+    std::cout << "> " << std::flush;
+    for (bool done = false; !done; ) {
+        if (const int nev = q(); nev < 0) {
+            break;
+        } else {
+            for (int i = 0; i < nev; ++i) {
+                if (q[i].flags & EV_ERROR)
+                    throw std::runtime_error(strerror(int(q[i].data)));
+                if (q[i].ident == uintptr_t(signal_pipe[0])) {
+                    done = true;
+                    break;
+                }
+                assert(q[i].ident == fileno(stdin));
+                for (ssize_t remaining = q[i].data; 0 < remaining; ) {
+                    const ssize_t bytes_read = read(
+                        fileno(stdin), p, space_left());
+                    if (bytes_read < 0) throw SYSTEM_ERROR(read);
+                    char* const nl = std::find(p, p + bytes_read, '\n');
+                    if (nl == p + bytes_read) {
+                        p += bytes_read;
+                        if (p == std::end(buf)) throw std::runtime_error("OOM");
+                    } else {
+                        *nl = '\0';
+                        std::cout << buf << '\n';
+                        std::copy_backward(nl + 1, p + bytes_read, buf);
+                        p = buf + (p + bytes_read - nl - 1);
+                        std::cout << "> " << std::flush;
+                    }
+                    remaining -= bytes_read;
+                }
+            }
+        }
+    }
+}
+
 #else
-#error TODO write IOQueue for linux
+
+#include <liburing.h>
+
+struct IOURing {
+    explicit IOURing(unsigned int entries);
+    ~IOURing() { io_uring_queue_exit(&ring); }
+    IOURing(IOURing&& o) = delete;
+    IOURing& operator=(IOURing&& o) = delete;
+    IOURing(const IOURing&) = delete;
+    IOURing& operator=(const IOURing&) = delete;
+
+    void prep_read(int fd, char* buf, unsigned int sz);
+    void seen(io_uring_cqe* cqe);
+    void submit();
+    io_uring_cqe* wait();
+
+private:
+    io_uring ring;
+};
+
+inline std::system_error iouring_error(int code, const char* context) {
+    return std::system_error(code, std::generic_category(), context);
+}
+
+std::system_error iouring_error(auto code, const char* context) {
+    return std::system_error(int(code), std::generic_category(), context);
+}
+
+#define IOURING_ERROR(code, context) iouring_error(-code, #context)
+
+IOURing::IOURing(unsigned int entries) {
+    assert(entries <= 4096 && std::popcount(entries) == 1);
+    const int rc = io_uring_queue_init(entries, &ring, 0);
+    if (rc) throw IOURING_ERROR(rc, io_uring_queue_init);
+}
+
+void IOURing::prep_read(int fd, char* buf, unsigned int sz) {
+    constexpr std::uint64_t offset = 0;
+    io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe, fd, buf, sz, offset);
+    sqe->user_data = __u64(fd);
+}
+
+void IOURing::seen(io_uring_cqe* cqe) {
+    io_uring_cqe_seen(&ring, cqe);
+}
+
+void IOURing::submit() {
+    const int rc = io_uring_submit(&ring);
+    if (rc < 0) throw IOURING_ERROR(rc, io_uring_submit);
+}
+
+io_uring_cqe* IOURing::wait() {
+    io_uring_cqe *cqe;
+    const int rc = io_uring_wait_cqe(&ring, &cqe);
+    if (-rc == EINTR) return nullptr;
+    if (rc) throw IOURING_ERROR(rc, io_uring_wait_cqe);
+    return cqe;
+}
+
+void repl(int signal_pipe) {
+    char buf[4096], pipe_buf[4096];
+    char* p = buf;
+    const auto space_left = [&](){ return uint32_t(std::end(buf) - p); };
+
+    constexpr int entries = 2;
+    IOURing ring(entries);
+    ring.prep_read(fileno(stdin), buf, sizeof buf);
+    ring.prep_read(signal_pipe, pipe_buf, sizeof pipe_buf);
+    ring.submit();
+
+    std::cout << "> " << std::flush;
+    for (;;) {
+        io_uring_cqe* const cqe = ring.wait();
+        if (!cqe) break;
+        if (int(cqe->user_data) == signal_pipe) {
+            ring.seen(cqe);
+            break;
+        } else {
+            assert(int(cqe->user_data) == fileno(stdin));
+            const ssize_t bytes_read = ssize_t(cqe->res);
+            ring.seen(cqe);
+            if (bytes_read < 0) throw IOURING_ERROR(bytes_read, stdin);
+            char* const nl = std::find(p, p + bytes_read, '\n');
+            if (nl == p + bytes_read) {
+                p += bytes_read;
+                if (p == std::end(buf)) throw std::runtime_error("OOM");
+            } else {
+                *nl = '\0';
+                std::cout << buf << '\n';
+                std::copy_backward(nl + 1, p + bytes_read, buf);
+                p = buf + (p + bytes_read - nl - 1);
+                ring.prep_read(fileno(stdin), p, space_left());
+                ring.submit();
+                std::cout << "> " << std::flush;
+            }
+        }
+    }
+}
+
 #endif
 
 namespace {
     // According to https://man7.org/linux/man-pages/man7/signal-safety.7.html
-    // we can call write from within our signal handler, so the plan is to
-    // create a pipe just to wake up select/epoll/kqueue whatever.
-    // Update: with kqueue, that is not necessary, as kevent will return EINTR.
-    // TODO: explore io_uring and determine whether we still need this pipe.
+    // and https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html,
+    // we can call write from within our signal handler, so we write to this
+    // pipe to wake up io_uring or kqueue. Even though io_uring and kqueue both
+    // return with errno set to EINTR in this situation, there is a race
+    // condition due to the possibility of a signal being received outside of a
+    // system call. Both io_uring and kqueue have a solution for that race
+    // condition, but we do this all the time rather than having two different
+    // ways. See https://www.sitepoint.com/the-self-pipe-trick-explained
+
     std::atomic<int> g_received_int_signal_notification_pipe = 0;
     void signal_handler(int) {
         const char buf = '\0';
@@ -95,48 +244,17 @@ int main() {
         int signal_pipe[2];
         const int pipe_rc = pipe(signal_pipe);
         if (pipe_rc == -1) throw SYSTEM_ERROR(pipe);
+        [[maybe_unused]] const int fcntl_rc = fcntl(
+            signal_pipe[1], F_SETFL, O_NONBLOCK);
+        assert(!fcntl_rc);
         g_received_int_signal_notification_pipe = signal_pipe[1];
         const FdCloser pipe_fds[2] = { signal_pipe[0], signal_pipe[1] };
 
         const auto signal_rc = signal(SIGINT, signal_handler);
         if (signal_rc == SIG_ERR) throw SYSTEM_ERROR(signal);
-
-        IOQueue q{fileno(stdin), signal_pipe[0]};
-        char buf[4096];
-        char* p = buf;
-        const auto space_left = [&](){ return std::size_t(std::end(buf) - p); };
-        std::cout << "> " << std::flush;
-        for (bool done = false; !done; ) {
-            if (const int nev = q(); nev < 0) {
-                done = true;
-            } else {
-                for (int i = 0; i < nev; ++i) {
-                    if (q[i].flags & EV_ERROR)
-                        throw std::runtime_error(strerror(int(q[i].data)));
-                    if (q[i].ident == uintptr_t(signal_pipe[0])) {
-                        done = true;
-                        break;
-                    }
-                    assert(q[i].ident == fileno(stdin));
-                    for (ssize_t remaining = q[i].data; 0 < remaining; ) {
-                        const ssize_t seen = read(fileno(stdin), p, space_left());
-                        if (seen < 0) throw SYSTEM_ERROR(read);
-                        char* const nl = std::find(p, p + seen, '\n');
-                        if (nl == p + seen) {
-                            p += seen;
-                            if (p == std::end(buf)) throw std::runtime_error("OOM");
-                        } else {
-                            *nl = '\0';
-                            std::cout << buf << '\n';
-                            std::copy_backward(nl + 1, p + seen, buf);
-                            p = buf + (p + seen - nl - 1);
-                            std::cout << "> " << std::flush;
-                        }
-                        remaining -= seen;
-                    }
-                }
-            }
-        }
+        repl(signal_pipe[0]);
+        std::cout << "bye!\n";
+        return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return EXIT_FAILURE;
