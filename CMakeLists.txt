@@ -22,7 +22,11 @@ target_link_libraries(dkvscore PRIVATE project_options project_warnings)
 
 add_executable(dkvs src/dkvs-main.cpp)
 target_compile_definitions(dkvs PUBLIC DOCTEST_CONFIG_DISABLE)
-target_link_libraries(dkvs PRIVATE project_options project_warnings dkvscore uring)
+if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    target_link_libraries(dkvs PRIVATE project_options project_warnings dkvscore uring)
+else()
+    target_link_libraries(dkvs PRIVATE project_options project_warnings dkvscore)
+endif()
 target_include_directories(dkvs PUBLIC src)
 
 add_executable(utest src/dkvs-test.cpp src/test-main.cpp ${CORE})
