@@ -379,16 +379,16 @@ namespace {
 int main() {
     try {
         int signal_pipe[2];
-        const int pipe_rc = pipe(signal_pipe);
-        if (pipe_rc == -1) throw SYSTEM_ERROR(pipe);
+        if (pipe(signal_pipe) == -1) throw SYSTEM_ERROR(pipe);
         [[maybe_unused]] const int fcntl_rc = fcntl(
             signal_pipe[1], F_SETFL, O_NONBLOCK);
         assert(!fcntl_rc);
         g_received_int_signal_notification_pipe = signal_pipe[1];
         const FdCloser pipe_fds[2] = { signal_pipe[0], signal_pipe[1] };
 
-        const auto signal_rc = signal(SIGINT, signal_handler);
-        if (signal_rc == SIG_ERR) throw SYSTEM_ERROR(signal);
+        struct sigaction sa = {};
+        sa.sa_handler = signal_handler;
+        if (sigaction(SIGINT, &sa, nullptr) < 0) throw SYSTEM_ERROR(sigaction);
 
         KV kv = load_snapshot("snapshot");
         repl(signal_pipe[0], kv);
