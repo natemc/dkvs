@@ -6,6 +6,7 @@
 #include <cstring>
 #include <dkvs.h>
 #include <fcntl.h>
+#include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
@@ -23,19 +24,51 @@
 
 using KV = std::unordered_map<std::string, std::string>;
 
-std::vector<uint8_t> serialize(const KV& kv) {
-    std::vector<uint8_t> r;
+std::vector<char> serialize(const KV& kv) {
+    std::vector<char> r;
     for (const auto& [k, v]: kv) {
-        assert(k.size() < 256);
-        assert(v.size() < 256);
-        r.push_back(uint8_t(k.size()));
-        std::transform(k.begin(), k.end(), std::back_inserter(r),
-                       [](char c){ return uint8_t(c); });
-        r.push_back(uint8_t(v.size()));
-        std::transform(v.begin(), v.end(), std::back_inserter(r),
-                       [](char c){ return uint8_t(c); });
+        assert(k.size() < 128);
+        assert(v.size() < 128);
+        r.push_back(char(k.size()));
+        std::copy(k.begin(), k.end(), std::back_inserter(r));
+        r.push_back(char(v.size()));
+        std::copy(v.begin(), v.end(), std::back_inserter(r));
     }
     return r;
+}
+
+KV deserialize(const std::vector<char>& s) {
+    KV kv;
+    for (auto it = s.begin(); it != s.end(); ) {
+        const char klen = *it++;
+        const std::string key(it, it + klen);
+        it += klen;
+        const char vlen = *it++;
+        kv[key] = std::string(it, it + vlen);
+        it += vlen;
+    }
+    return kv;
+}
+
+KV load_snapshot(const char* path) {
+    KV kv;
+    std::fstream f;
+    f.open(path, f.binary | f.in | f.ate);
+    if (!f.is_open()) throw SYSTEM_ERROR("snapshot");
+    std::vector<char> v(std::size_t(f.tellg()));
+    f.seekg(0, std::ios::beg);
+    if (!f.read(v.data(), std::streamsize(v.size())))
+        throw SYSTEM_ERROR("snapshot");
+    return deserialize(v);
+}
+
+void save_snapshot(const char* path, const KV& kv) {
+    const auto s = serialize(kv);
+    std::fstream f;
+    f.open(path, f.trunc | f.binary | f.out);
+    if (!f.is_open()) throw SYSTEM_ERROR("snapshot");
+    for (auto c: s) f << c;
+    f.close();
 }
 
 #define BAIL(CAT, DATA) \
@@ -73,7 +106,6 @@ void process_command(const char* command, KV& kv) {
 
 #ifdef __APPLE__
 
-#include <fstream>
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -124,16 +156,6 @@ int KQueue::operator()() {
     else                                     return num_triggered;
 }
 
-void save_snapshot(const KV& kv) {
-    const auto s = serialize(kv);
-    std::fstream f;
-    f.open("snapshot", f.app | f.binary | f.in | f.out);
-    if (!f.is_open()) throw SYSTEM_ERROR("snapshot");
-    for (auto c: s) f << c;
-    f.close();
-
-}
-
 void repl(int signal_pipe, KV& kv) {
     KQueue q{fileno(stdin), signal_pipe};
     char buf[4096];
@@ -163,7 +185,6 @@ void repl(int signal_pipe, KV& kv) {
                     } else {
                         *nl = '\0';
                         process_command(buf, kv);
-                        save_snapshot(kv);
                         std::copy_backward(nl + 1, p + bytes_read, buf);
                         p = buf + (p + bytes_read - nl - 1);
                         std::cout << "> " << std::flush;
@@ -179,6 +200,11 @@ void repl(int signal_pipe, KV& kv) {
 
 #include <liburing.h>
 
+struct Close { int fd; };
+struct FSync { int fd; };
+struct Read { int fd; void* buf; unsigned int sz; };
+struct Write { int fd; const void* buf; unsigned int sz; };
+
 struct IOURing {
     explicit IOURing(unsigned int entries);
     ~IOURing() { io_uring_queue_exit(&ring); }
@@ -187,9 +213,35 @@ struct IOURing {
     IOURing(const IOURing&) = delete;
     IOURing& operator=(const IOURing&) = delete;
 
-    void prep_read(int fd, char* buf, unsigned int sz);
+    template <class... O> void prep(const O&... ops) {
+        static_assert(0 < sizeof...(ops));
+        (void)std::initializer_list<io_uring_sqe*>{prep(ops)...};
+    }
+
+    template <class... O> void prep_linked(const O&... ops) {
+        static_assert(0 < sizeof...(ops));
+        std::initializer_list<io_uring_sqe*> sqes{prep(ops)...};
+        for (auto i = sqes.begin(); i != sqes.end() - 1; ++i)
+            (*i)->flags |= IOSQE_IO_LINK;
+    }
+
+    io_uring_sqe* prep(const Close&);
+    io_uring_sqe* prep(const FSync&);
+    io_uring_sqe* prep(const Read&);
+    io_uring_sqe* prep(const Write&);
+
     void seen(io_uring_cqe* cqe);
+
     void submit();
+    template <class... O> void submit(const O&... ops) {
+        prep(ops...);
+        submit();
+    }
+    template <class... O> void submit_linked(const O&... ops) {
+        prep_linked(ops...);
+        submit();
+    }
+
     io_uring_cqe* wait();
 
 private:
@@ -212,11 +264,35 @@ IOURing::IOURing(unsigned int entries) {
     if (rc) throw IOURING_ERROR(rc, io_uring_queue_init);
 }
 
-void IOURing::prep_read(int fd, char* buf, unsigned int sz) {
+io_uring_sqe* IOURing::prep(const Close& op) {
+    io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_close(sqe, op.fd);
+    sqe->user_data = __u64(op.fd);
+    return sqe;
+}
+
+io_uring_sqe* IOURing::prep(const FSync& op) {
+    constexpr unsigned int flags = 0;
+    io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_fsync(sqe, op.fd, flags);
+    sqe->user_data = __u64(op.fd);
+    return sqe;
+}
+
+io_uring_sqe* IOURing::prep(const Read& op) {
     constexpr std::uint64_t offset = 0;
     io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_read(sqe, fd, buf, sz, offset);
-    sqe->user_data = __u64(fd);
+    io_uring_prep_read(sqe, op.fd, op.buf, op.sz, offset);
+    sqe->user_data = __u64(op.fd);
+    return sqe;
+}
+
+io_uring_sqe* IOURing::prep(const Write& op) {
+    constexpr std::uint64_t offset = 0;
+    io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_write(sqe, op.fd, op.buf, op.sz, offset);
+    sqe->user_data = __u64(op.fd);
+    return sqe;
 }
 
 void IOURing::seen(io_uring_cqe* cqe) {
@@ -241,12 +317,10 @@ void repl(int signal_pipe, KV& kv) {
     char* p = buf;
     const auto space_left = [&](){ return uint32_t(std::end(buf) - p); };
 
-    constexpr int entries = 2;
+    constexpr int entries = 8;
     IOURing ring(entries);
-    ring.prep_read(fileno(stdin), buf, sizeof buf);
-    ring.prep_read(signal_pipe, pipe_buf, sizeof pipe_buf);
-    ring.submit();
-
+    ring.submit(Read{fileno(stdin), buf, sizeof buf},
+                Read{signal_pipe, pipe_buf, sizeof pipe_buf});
     std::cout << "> " << std::flush;
     for (;;) {
         io_uring_cqe* const cqe = ring.wait();
@@ -266,15 +340,9 @@ void repl(int signal_pipe, KV& kv) {
             } else {
                 *nl = '\0';
                 process_command(buf, kv);
-                std::vector<uint8_t> s = serialize(kv);
-                ring.prep_open();
-                ring.prep_write();
-                ring.prep_fsync(); // redundant due to close?
-                ring.prep_close();
                 std::copy_backward(nl + 1, p + bytes_read, buf);
                 p = buf + (p + bytes_read - nl - 1);
-                ring.prep_read(fileno(stdin), p, space_left());
-                ring.submit();
+                ring.submit(Read{fileno(stdin), p, space_left()});
                 std::cout << "> " << std::flush;
             }
         }
@@ -322,9 +390,9 @@ int main() {
         const auto signal_rc = signal(SIGINT, signal_handler);
         if (signal_rc == SIG_ERR) throw SYSTEM_ERROR(signal);
 
-        KV kv;
+        KV kv = load_snapshot("snapshot");
         repl(signal_pipe[0], kv);
-
+        save_snapshot("snapshot", kv);
         std::cout << "bye!\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
