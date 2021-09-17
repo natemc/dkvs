@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dkvs.h>
@@ -10,19 +12,84 @@
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#define SYSTEM_ERROR(context) \
-    std::system_error(errno, std::generic_category(), #context)
+#define SYSTEM_ERROR_CODE(code, context) \
+    std::system_error(code, std::generic_category(), #context)
+#define SYSTEM_ERROR(context) SYSTEM_ERROR_CODE(errno, context)
+
+struct FdCloser {
+    ~FdCloser() { if (0 <= fd) close(fd); }
+    int release() { return std::exchange(fd, -1); }
+    int fd;
+};
 
 using KV = std::unordered_map<std::string, std::string>;
+
+int client_socket(const char* host, uint16_t port) {
+    char service[6];
+    sprintf(service, "%d", port); // TODO use charconv
+    addrinfo hints = {};
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo *infos;
+    if (getaddrinfo(host, service, &hints, &infos) < 0)
+        throw SYSTEM_ERROR(getaddrinfo);
+
+    int fd = -1;
+    for (addrinfo* info = infos; info && fd < 0; info = info->ai_next) {
+        fd = socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+        if (0 <= fd && connect(fd, info->ai_addr, info->ai_addrlen) < 0) {
+            fd = -1;
+        }
+    }
+    if (0 <= fd) {
+        freeaddrinfo(infos);
+        return fd;
+    }
+
+    const int err = errno;
+    freeaddrinfo(infos);
+    throw SYSTEM_ERROR_CODE(err, connect);
+}
+
+// Returns -1 if port is already in use; throws on all other errors.
+int server_socket(uint16_t port, int queue_depth=64) {
+    constexpr int DEFAULT_PROTOCOL = 0;
+    const int fd = socket(AF_INET6, SOCK_STREAM, DEFAULT_PROTOCOL);
+    if (fd < 0) throw SYSTEM_ERROR(socket);
+    FdCloser closer(fd);
+
+    const int OFF = 0;
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &OFF, sizeof OFF) < 0)
+        throw SYSTEM_ERROR(setsockopt);
+
+    sockaddr_in6 addr = {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port);
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
+        if (errno == EADDRINUSE) return -1;
+        else                     throw SYSTEM_ERROR(bind);
+    }
+
+    if (listen(fd, queue_depth) < 0) throw SYSTEM_ERROR(listen);
+
+    return closer.release();
+}
 
 std::vector<char> serialize(const KV& kv) {
     std::vector<char> r;
@@ -200,10 +267,27 @@ void repl(int signal_pipe, KV& kv) {
 
 #include <liburing.h>
 
+struct Read {
+    Read(int fd_, void* buf_, unsigned int sz_): Read(fd_, buf_, sz_, fd_) {}
+
+    template <class U>
+        requires std::is_trivially_copyable_v<U> && (sizeof(U) <= sizeof(__u64))
+    Read(int fd_, void* buf_, unsigned int  sz_, U user_data_):
+        fd(fd_), buf(buf_), sz(sz_), user_data(0)
+    { memcpy(&user_data, &user_data_, sizeof user_data_); }
+
+    int fd;
+    void* buf;
+    unsigned int sz;
+    __u64 user_data;
+};
+
+struct Accept { int fd; sockaddr* addr; socklen_t* addrlen; };
 struct Close { int fd; };
 struct FSync { int fd; };
-struct Read { int fd; void* buf; unsigned int sz; };
+//struct Read { int fd; void* buf; unsigned int sz; };
 struct Write { int fd; const void* buf; unsigned int sz; };
+template <class... O> using Linked = std::tuple<O...>;
 
 struct IOURing {
     explicit IOURing(unsigned int entries);
@@ -213,39 +297,40 @@ struct IOURing {
     IOURing(const IOURing&) = delete;
     IOURing& operator=(const IOURing&) = delete;
 
+    template <class... O> void submit(const O&... ops) {
+        prep(ops...);
+        submit();
+    }
+    template <class... O> void submit(const Linked<O...>& ops) {
+        prep(ops);
+        submit();
+    }
+
+    io_uring_cqe* wait();
+    void seen(io_uring_cqe* cqe);
+
+private:
+    io_uring ring;
+
     template <class... O> void prep(const O&... ops) {
-        static_assert(0 < sizeof...(ops));
         (void)std::initializer_list<io_uring_sqe*>{prep(ops)...};
     }
 
-    template <class... O> void prep_linked(const O&... ops) {
-        static_assert(0 < sizeof...(ops));
-        std::initializer_list<io_uring_sqe*> sqes{prep(ops)...};
+    template <class... O> void prep(const Linked<O...>& ops) {
+        using SQEs = std::array<io_uring_sqe*, sizeof...(O)>;
+        const auto f = [&](const auto&... op) { return SQEs{prep(op)...}; };
+        const auto sqes = std::apply(f, ops);
         for (auto i = sqes.begin(); i != sqes.end() - 1; ++i)
             (*i)->flags |= IOSQE_IO_LINK;
     }
 
+    io_uring_sqe* prep(const Accept&);
     io_uring_sqe* prep(const Close&);
     io_uring_sqe* prep(const FSync&);
     io_uring_sqe* prep(const Read&);
     io_uring_sqe* prep(const Write&);
 
-    void seen(io_uring_cqe* cqe);
-
     void submit();
-    template <class... O> void submit(const O&... ops) {
-        prep(ops...);
-        submit();
-    }
-    template <class... O> void submit_linked(const O&... ops) {
-        prep_linked(ops...);
-        submit();
-    }
-
-    io_uring_cqe* wait();
-
-private:
-    io_uring ring;
 };
 
 inline std::system_error iouring_error(int code, const char* context) {
@@ -262,6 +347,14 @@ IOURing::IOURing(unsigned int entries) {
     assert(entries <= 4096 && std::popcount(entries) == 1);
     const int rc = io_uring_queue_init(entries, &ring, 0);
     if (rc) throw IOURING_ERROR(rc, io_uring_queue_init);
+}
+
+io_uring_sqe* IOURing::prep(const Accept& op) {
+    constexpr int NO_FLAGS = 0;
+    io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_accept(sqe, op.fd, op.addr, op.addrlen, NO_FLAGS);
+    sqe->user_data = __u64(op.fd);
+    return sqe;
 }
 
 io_uring_sqe* IOURing::prep(const Close& op) {
@@ -283,7 +376,7 @@ io_uring_sqe* IOURing::prep(const Read& op) {
     constexpr std::uint64_t offset = 0;
     io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
     io_uring_prep_read(sqe, op.fd, op.buf, op.sz, offset);
-    sqe->user_data = __u64(op.fd);
+    sqe->user_data = op.user_data;
     return sqe;
 }
 
@@ -307,29 +400,56 @@ void IOURing::submit() {
 io_uring_cqe* IOURing::wait() {
     io_uring_cqe *cqe;
     const int rc = io_uring_wait_cqe(&ring, &cqe);
-    if (-rc == EINTR) return nullptr;
-    if (rc) throw IOURING_ERROR(rc, io_uring_wait_cqe);
-    return cqe;
+    if      (-rc == EINTR) return nullptr;
+    else if (rc)           throw IOURING_ERROR(rc, io_uring_wait_cqe);
+    else                   return cqe;
 }
 
-void repl(int signal_pipe, KV& kv) {
+void client_repl(int signal_pipe, int sock) {
+}
+
+struct Buffer {
+    explicit Buffer(int fd_): p(data), fd(fd_) {}
+    uint32_t space_left() const { return uint32_t(std::end(data) - p); }
+    char data[4096];
+    char* p;
+    int fd;
+};
+
+void server_repl(int signal_pipe, int server_fd, KV& kv) {
+    // These values must not be legal pointers. An easy way to do that is to
+    // make them not divisble by 8.
+    constexpr int INTERRUPTED = 1;
+    constexpr int CONNECTION_ACCEPTED = 2;
+
     char buf[4096], pipe_buf[4096];
     char* p = buf;
     const auto space_left = [&](){ return uint32_t(std::end(buf) - p); };
+    sockaddr_in6 client_addr = {};
+    sockaddr* const addr = reinterpret_cast<sockaddr*>(&client_addr);
+    socklen_t addr_len;
 
     constexpr int entries = 8;
     IOURing ring(entries);
     ring.submit(Read{fileno(stdin), buf, sizeof buf},
+                Accept{server_fd, addr, &addr_len},
                 Read{signal_pipe, pipe_buf, sizeof pipe_buf});
     std::cout << "> " << std::flush;
     for (;;) {
         io_uring_cqe* const cqe = ring.wait();
         if (!cqe) break;
-        if (int(cqe->user_data) == signal_pipe) {
+        const int fd = int(cqe->user_data);
+        if (fd == signal_pipe) {
             ring.seen(cqe);
             break;
+        } else if (fd == server_fd) {
+            const int client_fd = cqe->res;
+            ring.seen(cqe);
+            if (client_fd < 0) throw IOURING_ERROR(client_fd, server);
+            // TODO create a Buffer, put it in the sqe user data
+//            Buffer* b = new Buffer(client_fd);
         } else {
-            assert(int(cqe->user_data) == fileno(stdin));
+            assert(fd == fileno(stdin));
             const ssize_t bytes_read = ssize_t(cqe->res);
             ring.seen(cqe);
             if (bytes_read < 0) throw IOURING_ERROR(bytes_read, stdin);
@@ -369,11 +489,6 @@ namespace {
         assert(p);
         [[maybe_unused]] const ssize_t written = write(p, &buf, sizeof buf);
     }
-
-    struct FdCloser {
-        ~FdCloser() { close(fd); }
-        int fd;
-    };
 } // namespace
 
 int main() {
@@ -390,9 +505,18 @@ int main() {
         sa.sa_handler = signal_handler;
         if (sigaction(SIGINT, &sa, nullptr) < 0) throw SYSTEM_ERROR(sigaction);
 
-        KV kv = load_snapshot("snapshot");
-        repl(signal_pipe[0], kv);
-        save_snapshot("snapshot", kv);
+        constexpr int PORT = 10010;
+        if (const int ss = server_socket(PORT); ss == -1) {
+            const int cs = client_socket("localhost", PORT);
+            const FdCloser cs_closer(cs);
+            client_repl(signal_pipe[0], cs);
+        } else {
+            const FdCloser ss_closer(ss);
+            KV kv = load_snapshot("snapshot");
+            server_repl(signal_pipe[0], ss, kv);
+            save_snapshot("snapshot", kv);
+        }
+
         std::cout << "bye!\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
