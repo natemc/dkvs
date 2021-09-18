@@ -185,6 +185,7 @@ std::ostream& process_command(
         } else {
             const std::string key(sp + 1, eq);
             kv[key] = eq + 1;
+            os << "Done.";
         }
     } else {
         os << "Invalid command: " << command;
