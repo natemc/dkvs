@@ -1,0 +1,12 @@
+syntax = "proto3";
+option cc_enable_arenas = true;
+option optimize_for     = LITE_RUNTIME;
+
+message Get  { string key = 1; }
+message Set  { string key = 1; string value = 2; }
+message Fail { string message = 1; }
+message Got  { string value = 1; }
+message Sot  {}
+
+message Request  { oneof Command { Get get = 1; Set set = 2; } }
+message Response { oneof Reply { Got got = 1; Sot sot = 2; Fail fail = 3; } }
