@@ -4,10 +4,17 @@
 #include <cstdlib>
 #include <dkvs.h>
 #include <fcntl.h>
+#include <google/protobuf/stubs/common.h>
 #include <iostream>
+#include <pb.h>
 #include <unistd.h>
 
 namespace {
+    struct ProtobufGuard {
+        ProtobufGuard() { GOOGLE_PROTOBUF_VERIFY_VERSION; }
+        ~ProtobufGuard() { google::protobuf::ShutdownProtobufLibrary(); }
+    };
+
     // According to https://man7.org/linux/man-pages/man7/signal-safety.7.html
     // and https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html,
     // we can call write from within our signal handler, so we write to this
@@ -48,11 +55,12 @@ int main() {
             if (const int ss = server_socket(PORT); ss == -1) {
                 const int cs = client_socket("localhost", PORT);
                 const FdCloser cs_closer(cs);
-                client_repl(signal_pipe[0], cs);
+                PbClientSerdes serdes;
+                client_repl(signal_pipe[0], cs, serdes);
             } else {
                 const FdCloser ss_closer(ss);
                 KV kv = load_snapshot("snapshot");
-                server_repl(signal_pipe[0], ss, kv);
+                server_repl(signal_pipe[0], ss, kv, pb_process_request);
                 save_snapshot("snapshot", kv);
             }
 

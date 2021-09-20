@@ -2,6 +2,7 @@
 #include <cassert>
 #include <command.h>
 #include <cstring>
+#include <dkvs.pb.h>
 #include <doctest.h>
 #include <iomanip>
 #include <iostream>
@@ -13,22 +14,96 @@
 
 using namespace std::literals;
 
-std::ostream& pb_deserialize_response(std::ostream& os, std::string_view message) {
-    assert(message.size() <= std::numeric_limits<int>::max());
+namespace {
+    std::ostream& pb_deserialize_response(
+        std::ostream& os, std::string_view message)
+    {
+        assert(message.size() <= std::numeric_limits<int>::max());
 
-    Response r;
-    if (!r.ParseFromArray(message.data(), static_cast<int>(message.size())))
-        throw std::runtime_error("Bad message received");
-    switch (r.Reply_case()) {
-    case Response::ReplyCase::kGot : return os << r.got().value();
-    case Response::ReplyCase::kSot : return os << "Done.";
-    case Response::ReplyCase::kFail: return os << r.fail().message();
-    default                        : throw std::runtime_error("Bad message");
+        Response r;
+        if (!r.ParseFromArray(message.data(), static_cast<int>(message.size())))
+            throw std::runtime_error("Bad message received");
+        switch (r.Reply_case()) {
+        case Response::ReplyCase::kGot : return os << r.got().value();
+        case Response::ReplyCase::kSot : return os << "Done.";
+        case Response::ReplyCase::kFail: return os << r.fail().message();
+        default                        : throw std::runtime_error("Bad message");
+        }
+        return os;
     }
-    return os;
+
+    int32_t pb_serialize(
+        std::span<char> dest, const google::protobuf::MessageLite& message)
+    {
+        assert(dest.size() <= std::numeric_limits<int32_t>::max());
+
+        const auto sz = message.ByteSizeLong();
+        if (dest.size() < sz || std::numeric_limits<int32_t>::max() < sz) {
+            return -1;
+            //throw std::runtime_error("Message too large");
+        }
+
+        uint8_t* const buf = reinterpret_cast<uint8_t*>(dest.data()); // UB :-(
+        uint8_t* const last = message.SerializeWithCachedSizesToArray(buf);
+        assert(sz == last - buf);
+        return static_cast<int32_t>(last - buf);
+    }
+
+    TEST_CASE("pb_deserialize_response(pb_serialize(Response)) is identity") {
+        const auto v = "who's there?"s;
+        Response r;
+        r.mutable_got()->set_value(v);
+        char buf[4096];
+        const auto len = pb_serialize(std::span(buf, buf + sizeof buf), r);
+        CHECK(len > 0);
+        std::ostringstream os;
+        pb_deserialize_response(os, {buf, static_cast<std::size_t>(len)});
+        CHECK(v == os.str());
+    }
+
+    int32_t pb_serialize_request(std::span<char> dest, std::string_view command) {
+        Request r;
+        if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
+            *r.mutable_get()->mutable_key() = args;
+        } else if (cmd == Command::set) {
+            if (const auto params = parse_set_args(args); params.empty()) {
+                //throw std::runtime_error("Invalid arguments to set command");
+                return -1;
+            } else {
+                for (const auto& [key, value]: params) {
+                    const auto m = r.mutable_set()->add_mapping();
+                    *m->mutable_key() = key;
+                    *m->mutable_value() = value;
+                }
+            }
+        } else {
+            return -1;
+            //throw std::runtime_error("Invalid command");
+        }
+
+        return pb_serialize(dest, r);
+    }
+
+    TEST_CASE("pb_serialize_request does") {
+        char buf[4096];
+        const auto len = pb_serialize_request({buf, sizeof buf}, "get key"sv);
+        CHECK(0 < len);
+    }
+} // namespace
+
+std::ostream& PbClientSerdes::deserialize_response(
+    std::ostream& os, std::string_view message)
+{
+    return pb_deserialize_response(os, message);
 }
 
-Response pb_process_request(std::string_view message, KV& kv) {
+int32_t PbClientSerdes::serialize_request(
+    std::span<char> dest, std::string_view command)
+{
+    return pb_serialize_request(dest, command);
+}
+
+int32_t pb_process_request(std::span<char> dest, std::string_view message, KV& kv) {
     assert(message.size() <= std::numeric_limits<int>::max());
 
     Request in;
@@ -44,70 +119,21 @@ Response pb_process_request(std::string_view message, KV& kv) {
             os << in.get().key() << " is not bound.";
             out.mutable_fail()->set_message(std::move(os).str());
         }
-        return out;
-    case Request::CommandCase::kSet:
-        kv[in.set().key()] = in.set().value();
+        break;
+    case Request::CommandCase::kSet: {
+        const auto& s = in.set();
+        const int n = s.mapping_size();
+        for (int i = 0; i < n; ++i) {
+            const auto& m = s.mapping(i);
+            kv[m.key()] = m.value();
+        }
         out.mutable_sot();
-        return out;
+        break;
+    }
     default                        :
         out.mutable_fail()->set_message("Unknown command");
-        return out;
-    }
-}
-
-int32_t pb_serialize(std::span<char> dest, const google::protobuf::MessageLite& message) {
-    assert(dest.size() <= std::numeric_limits<int32_t>::max() - 4);
-
-    const auto sz = message.ByteSizeLong();
-    if (dest.size() - 4 < sz || std::numeric_limits<int32_t>::max() < sz + 4) {
-        return -1;
-        //throw std::runtime_error("Message too large");
+        break;
     }
 
-    uint8_t* const buf = reinterpret_cast<uint8_t*>(dest.data() + 4); // UB :-(
-    uint8_t* const last = message.SerializeWithCachedSizesToArray(buf);
-    assert(message.GetCachedSize() == last - buf);
-    const int32_t len = static_cast<int32_t>(last - buf);
-    memcpy(dest.data(), &len, sizeof len); // TODO handle endianness
-    return len + 4;
-}
-
-TEST_CASE("pb_deserialize_response(pb_serialize(Response)) is identity") {
-    const auto v = "who's there?"s;
-    Response r;
-    r.mutable_got()->set_value(v);
-    char buf[4096];
-    const auto len = pb_serialize(std::span(buf, buf + sizeof buf), r);
-    CHECK(len > 0);
-    std::ostringstream os;
-    pb_deserialize_response(os, {buf + 4, static_cast<std::size_t>(len - 4)});
-    CHECK(v == os.str());
-}
-
-// Returns # of bytes written to dest or -1 if an error occurred
-int32_t pb_serialize_request(std::span<char> dest, std::string_view command) {
-    Request r;
-    if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
-        *r.mutable_get()->mutable_key() = args;
-    } else if (cmd == Command::set) {
-        if (const auto params = parse_set_args(args); !params) {
-            //throw std::runtime_error("Invalid arguments to set command");
-            return -1;
-        } else {
-            const auto& [key, value] = *params;
-            *r.mutable_set()->mutable_key() = key;
-            *r.mutable_set()->mutable_value() = value;
-        }
-    } else {
-        return -1;
-        //throw std::runtime_error("Invalid command");
-    }
-
-    return pb_serialize(dest, r);
-}
-
-TEST_CASE("pb_serialize_request does") {
-    char buf[4096];
-    const auto len = pb_serialize_request({buf, sizeof buf}, "get key"sv);
-    CHECK(4 < len);
+    return pb_serialize(dest, out);
 }

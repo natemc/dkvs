@@ -1,5 +1,6 @@
 #include <command.h>
 #include <doctest.h>
+#include <iostream>
 
 using namespace std::literals;
 
@@ -35,16 +36,25 @@ TEST_CASE("which_command recognizes get and set") {
     CHECK(Command::invalid == which_command("oops").first);
 }
 
-std::optional<std::pair<std::string_view, std::string_view>>
+std::vector<std::pair<std::string_view, std::string_view>>
 parse_set_args(std::string_view args) {
-    if (const auto eq = args.find('='); eq == args.npos || eq == 0) {
-        return {};
-    } else {
-        return {{trim(args.substr(0, eq)), trim(args.substr(eq + 1))}};
+    constexpr auto ws = "\b\n\r\t "sv;
+    std::vector<std::pair<std::string_view, std::string_view>> r;
+    std::string_view::size_type p = args.find_first_not_of(ws);
+     while (p != args.npos) {
+        const auto eq = args.find('=', p);
+        if (eq == args.npos || eq == p) return {};
+        const auto end = args.find_first_of(ws, eq + 1);
+        const auto key = args.substr(p, eq - p);
+        const auto value = args.substr(eq + 1, end == args.npos? args.npos : end - (eq + 1));
+        r.emplace_back(trim(key), trim(value));
+        p = end == args.npos? end : args.find_first_not_of(ws, end + 1);
     }
+    return r;
 }
 
 TEST_CASE("parse_set_args splits on = and trims") {
-    CHECK(std::pair("abc"sv, "def"sv) == *parse_set_args("abc=def"sv));
-    CHECK(std::pair("abc"sv, "def"sv) == *parse_set_args("abc = def"sv));
+    CHECK(std::pair("abc"sv, "def"sv) == parse_set_args("abc=def"sv)[0]);
+    CHECK(std::pair("abc"sv, "def"sv) == parse_set_args("abc=def ghi=jkl"sv)[0]);
+    CHECK(std::pair("ghi"sv, "jkl"sv) == parse_set_args("abc=def ghi=jkl"sv)[1]);
 }

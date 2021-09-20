@@ -1,13 +1,17 @@
 #include <dkvs.h>
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <charconv>
+#include <client_serdes.h>
 #include <command.h>
 #include <cstdio>
 #include <cstring>
 #include <doctest.h>
 #include <fstream>
 #include <initializer_list>
+#include <iomanip>
+#include <iostream>
 #include <iterator>
 #include <optional>
 #include <liburing.h>
@@ -71,20 +75,17 @@ namespace {
         if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
             const std::string key(args);
             const auto it = kv.find(key);
-            if (it != kv.end()) os << it->second;
-            else                os << key << " is not bound.";
+            return it != kv.end()? os << it->second : os << key << " is not bound.";
         } else if (cmd == Command::set) {
-            if (const auto params = parse_set_args(args); !params) {
-                os << "Invalid command: " << command;
+            if (const auto params = parse_set_args(args); params.empty()) {
+                return os << "Invalid command: " << command;
             } else {
-                const auto& [key, value] = *params;
-                kv[std::string{key}] = std::string{value};
-                os << "Done.";
+                for (const auto& [key, value]: params)
+                    kv[std::string(key)] = std::string(value);
+                return os << "Done.";                
             }
-        } else {
-            os << "Invalid command: " << command;
         }
-        return os;
+        return os << "Invalid command: " << command;
     }
 
     // Returns the length of the message or -1 if we need to wait for more data
@@ -93,7 +94,7 @@ namespace {
         int32_t len;
         memcpy(&len, data.data(), sizeof len); // TODO handle endianness
         if (len <= 0) throw std::runtime_error("bad message");
-        return static_cast<std::size_t>(len) <= data.size()? len : -1;
+        return static_cast<std::size_t>(len) + 4 < data.size()? -1 : len;
     }
 
     struct Read {
@@ -252,9 +253,6 @@ namespace {
 FdCloser::~FdCloser() { if (0 <= fd) close(fd); }
 int FdCloser::release() { return std::exchange(fd, -1); }
 
-ProtobufGuard::ProtobufGuard() { GOOGLE_PROTOBUF_VERIFY_VERSION; }
-ProtobufGuard::~ProtobufGuard() { google::protobuf::ShutdownProtobufLibrary(); }
-
 int client_socket(const char* host, uint16_t port) {
     char service[6];
     const auto [p, ec] = std::to_chars(service, service + sizeof service, port);
@@ -348,7 +346,7 @@ void save_snapshot(const char* path, const KV& kv) {
     }
 }
 
-void client_repl(int signal_pipe, int sock) {
+void client_repl(int signal_pipe, int sock, ClientSerdes& serdes) {
     Buffer pipe_buf(signal_pipe);
     Buffer sock_buf(sock);
     Buffer stdin_buf(fileno(stdin));
@@ -375,15 +373,15 @@ void client_repl(int signal_pipe, int sock) {
         if (b == &sock_buf) {
             if (bytes_read < 0) throw IOURING_ERROR(bytes_read, server);
             sock_buf.p += bytes_read;
-            const int32_t len = whole_message(std::span{sock_buf.data, sock_buf.p});
+            const auto len = whole_message(std::span{sock_buf.data, sock_buf.p});
             if (len < 0) {
                 ring.submit(Read{
                     sock_buf.fd, sock_buf.p, sock_buf.space_left(), &sock_buf});
             } else {
                 // We don't expect multiple messages back at once
-                assert(len == sock_buf.p - (sock_buf.data + 4));
-                std::string_view data{sock_buf.data + 4, static_cast<std::size_t>(len)};
-                pb_deserialize_response(std::cout, data) << '\n';
+                assert(len == sock_buf.p - (sock_buf.data + sizeof len));
+                std::string_view data{sock_buf.data + sizeof len, static_cast<std::size_t>(len)};
+                serdes.deserialize_response(std::cout, data) << '\n';
                 sock_buf.p = sock_buf.data;
                 ring.submit(Read{
                     stdin_buf.fd, stdin_buf.data, sizeof stdin_buf.data, &stdin_buf});
@@ -402,14 +400,17 @@ void client_repl(int signal_pipe, int sock) {
                 ring.submit(Read{stdin_buf.fd, stdin_buf.p, stdin_buf.space_left(), &stdin_buf});
             } else {
                 stdin_buf.p = stdin_buf.data;
-                std::span<char> dest{sock_buf.data, sizeof sock_buf.data};
+                std::span<char> dest{sock_buf.data + sizeof(int32_t), sizeof sock_buf.data - 4};
                 std::string_view src{stdin_buf.data, nl};
-                const auto len = pb_serialize_request(dest, src);
+                const int32_t len = serdes.serialize_request(dest, src);
                 if (len < 0) {
                     std::cerr << "Invalid command: " << src << "\n> ";
                     ring.submit(Read{stdin_buf.fd, stdin_buf.p, stdin_buf.space_left(), &stdin_buf});
                 } else {
-                    const auto sz = static_cast<unsigned int>(len);
+                    memcpy(sock_buf.data, &len, sizeof len); // TODO endianness
+                    const auto SZ = static_cast<std::size_t>(len) + sizeof len;
+                    assert(SZ < std::numeric_limits<unsigned int>::max());
+                    const auto sz = static_cast<unsigned int>(SZ);
                     ring.submit(Link{Write(sock_buf.fd, sock_buf.data, sz, WRITE_COMPLETED),
                                      Read(sock_buf.fd, sock_buf.data, sizeof sock_buf.data, &sock_buf)});
                 }
@@ -418,7 +419,9 @@ void client_repl(int signal_pipe, int sock) {
     }
 }
 
-void server_repl(int signal_pipe, int server_fd, KV& kv) {
+void server_repl(
+    int signal_pipe, int server_fd, KV& kv, process_request_t process_request)
+{
     // TODO check isatty and handle differently if not?
     // Would be handy for testing if nothing else.
 
@@ -496,14 +499,21 @@ void server_repl(int signal_pipe, int server_fd, KV& kv) {
             if (len < 0) {
                 ring.submit(Read{b->fd, b->p, b->space_left(), b});
             } else {
-                std::string_view request{b->data + 4, static_cast<std::size_t>(len)};
-                const Response r = pb_process_request(request, kv);
-                std::span<char> dest{b->data, sizeof b->data};
-                const auto sz = static_cast<unsigned int>(pb_serialize(dest, r));
-                // TODO support multiple requests w/o round-trip on each
+                std::string_view request{b->data + sizeof len, static_cast<std::size_t>(len)};
+                std::span<char> dest{b->data + sizeof len, sizeof b->data - sizeof len};
+                const int32_t len = process_request(dest, request, kv);
                 b->p = b->data;
-                ring.submit(Link{Write(b->fd, b->data, sz, WRITE_COMPLETED),
-                                 Read(b->fd, b->data, sizeof b->data, b)});
+                if (len < 0) {
+                    std::cerr << "Bad message";
+                } else {
+                    memcpy(b->data, &len, sizeof len); // TODO endianness
+                    const auto SZ = static_cast<std::size_t>(len) + sizeof len;
+                    assert(SZ < std::numeric_limits<unsigned int>::max());
+                    const auto sz = static_cast<unsigned int>(SZ);
+                    // TODO support multiple requests w/o round-trip on each
+                    ring.submit(Link{Write(b->fd, b->data, sz, WRITE_COMPLETED),
+                                     Read(b->fd, b->data, sizeof b->data, b)});
+                }
             }
         }
     }

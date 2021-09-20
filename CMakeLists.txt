@@ -16,7 +16,11 @@ include(cmake/StaticAnalyzers.cmake)
 
 set(CORE src/command.cpp src/dkvs.cpp src/kv.cpp src/pb.cpp)
 
-add_library(dkvscore ${CORE} ${PROTO_SRCS})
+add_library(pb ${PROTO_SRCS})
+target_include_directories(pb PUBLIC ${CMAKE_CURRENT_BINARY_DIR} src)
+target_link_libraries(pb PRIVATE project_options)
+
+add_library(dkvscore ${CORE})
 target_compile_definitions(dkvscore PUBLIC DOCTEST_CONFIG_DISABLE)
 target_include_directories(dkvscore PUBLIC ${CMAKE_CURRENT_BINARY_DIR} src)
 target_link_libraries(dkvscore PRIVATE project_options project_warnings)
@@ -25,13 +29,13 @@ add_executable(dkvs src/dkvs-main.cpp)
 target_compile_definitions(dkvs PUBLIC DOCTEST_CONFIG_DISABLE)
 if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     target_link_libraries(dkvs PRIVATE project_options project_warnings
-        dkvscore ${Protobuf_LITE_LIBRARY} uring)
+        dkvscore pb ${Protobuf_LITE_LIBRARY} uring)
 else()
-    target_link_libraries(dkvs PRIVATE project_options project_warnings dkvscore)
+    target_link_libraries(dkvs PRIVATE project_options project_warnings dkvscore pb)
 endif()
 target_include_directories(dkvs PUBLIC src)
 
-add_executable(utest src/dkvs-test.cpp src/test-main.cpp ${CORE} ${PROTO_SRCS})
+add_executable(utest src/dkvs-test.cpp src/test-main.cpp ${CORE})
 target_include_directories(utest PUBLIC ${CMAKE_CURRENT_BINARY_DIR} src)
 target_link_libraries(utest PRIVATE project_options project_warnings
-    ${Protobuf_LITE_LIBRARY} uring)
+    pb ${Protobuf_LITE_LIBRARY} uring)
