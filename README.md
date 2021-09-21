@@ -27,7 +27,7 @@ Done.
 >
 ```
 
-The current version is client-server: you can run more instances of build/dkvs, and each one will connect to the first:
+The current version is client-server. You can run more instances of build/dkvs, and each one will connect to the first:
 
 ```
 $ build/dkvs
