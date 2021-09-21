@@ -3,7 +3,7 @@ Exercises for the Bradfield Distributed Systems Course.
 
 ## Build
 
-Requires a recent Linux kernel (>= 5.6), liburing, Protobuf (3), cmake >= 3.18, and C++20 (I've been using g++ and haven't tried clang).
+Requires a recent Linux kernel (>= 5.6), liburing, Protobuf (3), cmake >= 3.18, doctest, and C++20 (I've been using g++ and haven't tried clang).
 
 ```
 $ cmake -S . -B build
