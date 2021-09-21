@@ -66,6 +66,7 @@ namespace {
         if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
             *r.mutable_get()->mutable_key() = args;
         } else if (cmd == Command::set) {
+            // TODO Consider doing the parsing inline to be more efficient
             if (const auto params = parse_set_args(args); params.empty()) {
                 //throw std::runtime_error("Invalid arguments to set command");
                 return -1;

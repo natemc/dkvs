@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <dkvs.h>
 #include <fcntl.h>
+#include <fdcloser.h>
 #include <google/protobuf/stubs/common.h>
 #include <iostream>
 #include <pb.h>
@@ -34,7 +35,7 @@ namespace {
     }
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
         const ProtobufGuard pbguard;
 
@@ -58,10 +59,11 @@ int main() {
                 PbClientSerdes serdes;
                 client_repl(signal_pipe[0], cs, serdes);
             } else {
+                const char* const snapshot = argc == 1? "snapshot" : argv[1];
                 const FdCloser ss_closer(ss);
-                KV kv = load_snapshot("snapshot");
+                KV kv = load_snapshot(snapshot);
                 server_repl(signal_pipe[0], ss, kv, pb_process_request);
-                save_snapshot("snapshot", kv);
+                save_snapshot(snapshot, kv);
             }
 
             std::cout << "bye!\n";

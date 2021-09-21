@@ -14,10 +14,11 @@ include(cmake/Sanitizers.cmake)
 enable_sanitizers(project_options)
 include(cmake/StaticAnalyzers.cmake)
 
-set(CORE src/command.cpp src/dkvs.cpp src/kv.cpp src/pb.cpp)
+set(CORE src/command.cpp src/dkvs.cpp src/fdcloser.cpp
+         src/kv.cpp src/pb.cpp src/iouring.cpp)
 
 add_library(pb ${PROTO_SRCS})
-target_include_directories(pb PUBLIC ${CMAKE_CURRENT_BINARY_DIR} src)
+target_include_directories(pb PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(pb PRIVATE project_options)
 
 add_library(dkvscore ${CORE})

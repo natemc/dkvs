@@ -10,12 +10,6 @@
 #define SYSTEM_ERROR_MSG(msg) SYSTEM_ERROR_CODE(errno, msg)
 #define SYSTEM_ERROR(context) SYSTEM_ERROR_MSG(#context)
 
-struct FdCloser {
-    ~FdCloser();
-    int release();
-    int fd;
-};
-
 // Returns valid fd or throws
 int client_socket(const char* host, uint16_t port);
 

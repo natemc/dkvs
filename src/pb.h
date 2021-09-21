@@ -1,5 +1,7 @@
 #pragma once
 
+// Protobuf serialization and deserialization
+
 #include <client_serdes.h>
 #include <kv.h>
 #include <span>

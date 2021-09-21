@@ -8,23 +8,26 @@
 #include <cstdio>
 #include <cstring>
 #include <doctest.h>
+#include <fcntl.h>
+#include <fdcloser.h>
 #include <fstream>
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
-#include <optional>
-#include <liburing.h>
 #include <limits>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pb.h>
+#include <iouring.h>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <tuple>
 #include <type_traits>
@@ -51,7 +54,7 @@ namespace {
         return r;
     }
 
-    KV deserialize(const std::vector<char>& s) {
+    KV deserialize(std::span<const char> s) {
         KV kv;
         for (auto it = s.begin(); it != s.end(); ) {
             const char klen = *it++;
@@ -97,145 +100,6 @@ namespace {
         return static_cast<std::size_t>(len) + 4 < data.size()? -1 : len;
     }
 
-    struct Read {
-        template <class U>
-            requires std::is_trivially_copyable_v<U> && (sizeof(U) <= sizeof(__u64))
-        Read(int fd_, void* buf_, unsigned int  sz_, U user_data_):
-            fd(fd_), buf(buf_), sz(sz_), user_data(0)
-        { memcpy(&user_data, &user_data_, sizeof user_data_); }
-
-        int fd;
-        void* buf;
-        unsigned int sz;
-        __u64 user_data;
-    };
-
-    struct Accept { int fd; sockaddr* addr; socklen_t* addrlen; __u64 user_data; };
-    struct Close { int fd; __u64 user_data; };
-    struct FSync { int fd; };
-    struct Write { int fd; const void* buf; unsigned int sz; __u64 user_data; };
-    template <class... O> using Link = std::tuple<O...>;
-
-    struct IOURing {
-        explicit IOURing(unsigned int entries);
-        ~IOURing() { io_uring_queue_exit(&ring); }
-        IOURing(IOURing&& o) = delete;
-        IOURing& operator=(IOURing&& o) = delete;
-        IOURing(const IOURing&) = delete;
-        IOURing& operator=(const IOURing&) = delete;
-
-        // Cannot fail at runtime; errors are communicated via the cqe
-        // returned from wait.
-        template <class... O> void submit(const O&... ops) {
-            prep(ops...);
-            submit();
-        }
-        template <class... O> void submit(const Link<O...>& ops) {
-            prep(ops);
-            submit();
-        }
-
-        io_uring_cqe* wait();
-        void seen(io_uring_cqe* cqe);
-
-    private:
-        io_uring ring;
-
-        template <class... O> void prep(const O&... ops) {
-            (void)std::initializer_list<io_uring_sqe*>{prep(ops)...};
-        }
-
-        template <class... O> void prep(const Link<O...>& ops) {
-            using SQEs = std::array<io_uring_sqe*, sizeof...(O)>;
-            const auto f = [&](const auto&... op) { return SQEs{prep(op)...}; };
-            const auto sqes = std::apply(f, ops);
-            for (auto i = sqes.begin(); i != sqes.end() - 1; ++i)
-                (*i)->flags |= IOSQE_IO_LINK;
-        }
-
-        io_uring_sqe* prep(const Accept&);
-        io_uring_sqe* prep(const Close&);
-        io_uring_sqe* prep(const FSync&);
-        io_uring_sqe* prep(const Read&);
-        io_uring_sqe* prep(const Write&);
-
-        void submit();
-    };
-
-    inline std::system_error iouring_error(int code, const char* context) {
-        return std::system_error(code, std::generic_category(), context);
-    }
-
-    std::system_error iouring_error(auto code, const char* context) {
-        return std::system_error(int(code), std::generic_category(), context);
-    }
-
-#define IOURING_ERROR(code, context) iouring_error(-code, #context)
-
-    IOURing::IOURing(unsigned int entries) {
-        assert(entries <= 4096 && std::popcount(entries) == 1);
-        const int rc = io_uring_queue_init(entries, &ring, 0);
-        if (rc) throw IOURING_ERROR(rc, io_uring_queue_init);
-    }
-
-    io_uring_sqe* IOURing::prep(const Accept& op) {
-        constexpr int NO_FLAGS = 0;
-        io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_accept(sqe, op.fd, op.addr, op.addrlen, NO_FLAGS);
-        sqe->user_data = __u64(op.user_data);
-        return sqe;
-    }
-
-    io_uring_sqe* IOURing::prep(const Close& op) {
-        io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_close(sqe, op.fd);
-        sqe->user_data = __u64(op.user_data);
-        return sqe;
-    }
-
-    io_uring_sqe* IOURing::prep(const FSync& op) {
-        constexpr unsigned int flags = 0;
-        io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_fsync(sqe, op.fd, flags);
-        sqe->user_data = __u64(op.fd);
-        return sqe;
-    }
-
-    io_uring_sqe* IOURing::prep(const Read& op) {
-        constexpr std::uint64_t offset = 0;
-        io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_read(sqe, op.fd, op.buf, op.sz, offset);
-        sqe->user_data = op.user_data;
-        return sqe;
-    }
-
-    io_uring_sqe* IOURing::prep(const Write& op) {
-        constexpr std::uint64_t offset = 0;
-        io_uring_sqe* const sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_write(sqe, op.fd, op.buf, op.sz, offset);
-        sqe->user_data = __u64(op.user_data);
-        return sqe;
-    }
-
-    void IOURing::seen(io_uring_cqe* cqe) {
-        io_uring_cqe_seen(&ring, cqe);
-    }
-
-    void IOURing::submit() {
-        const int rc = io_uring_submit(&ring);
-        if (rc < 0) throw IOURING_ERROR(rc, io_uring_submit);
-    }
-
-    // Returns nullptr on SIGINT; throws on io uring errors.
-    // Check the res member of the returned cqe for operation-related errors.
-    io_uring_cqe* IOURing::wait() {
-        io_uring_cqe *cqe;
-        const int rc = io_uring_wait_cqe(&ring, &cqe);
-        if      (-rc == EINTR) return nullptr;
-        else if (rc)           throw IOURING_ERROR(rc, io_uring_wait_cqe);
-        else                   return cqe;
-    }
-
     struct Buffer {
         explicit Buffer(int fd_): p(data), fd(fd_) {}
         uint32_t space_left() const { return uint32_t(std::end(data) - p); }
@@ -249,9 +113,6 @@ namespace {
     constexpr __u64 CONNECTION_ACCEPTED = 2;
     constexpr __u64 WRITE_COMPLETED     = 3;
 } // namespace
-
-FdCloser::~FdCloser() { if (0 <= fd) close(fd); }
-int FdCloser::release() { return std::exchange(fd, -1); }
 
 int client_socket(const char* host, uint16_t port) {
     char service[6];
@@ -315,21 +176,22 @@ int server_socket(uint16_t port, int queue_depth) {
 }
 
 KV load_snapshot(const char* path) {
-    KV kv;
-    std::fstream f;
-    f.open(path, f.binary | f.in | f.ate);
-    if (!f.is_open()) {
-        return kv;
-    } else {
-        static_assert(sizeof(std::streamsize) <= sizeof(std::size_t));
-        std::vector<char> v(static_cast<std::size_t>(f.tellg()));
-        assert(v.size() <= std::numeric_limits<std::streamsize>::max());
-        const std::streamsize sz = static_cast<std::streamsize>(v.size());
-        f.seekg(0, std::ios::beg);
-        if (f.read(v.data(), sz)) return deserialize(v);
-        else                      throw SYSTEM_ERROR_MSG(path);
-
-    }
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return KV{};
+    const FdCloser closer(fd);
+    struct stat st;
+    if (const int rc = fstat(fd, &st); rc < 0) throw SYSTEM_ERROR(fstat);
+    assert(0 <= st.st_size);
+    const std::size_t sz = static_cast<std::size_t>(st.st_size);
+    constexpr off_t FROM_THE_BEGINNING = 0;
+    constexpr void* const WHEREVER = nullptr;
+    void * const m = mmap(WHEREVER, sz, PROT_READ,
+        MAP_POPULATE|MAP_PRIVATE, fd, FROM_THE_BEGINNING);
+    if (!m) throw SYSTEM_ERROR(mmap);
+    const auto r = deserialize(std::span{static_cast<const char*>(m), sz});
+    [[maybe_unused]] const int rc = munmap(m, sz);
+    assert(rc == 0);
+    return r;
 }
 
 void save_snapshot(const char* path, const KV& kv) {
@@ -337,7 +199,7 @@ void save_snapshot(const char* path, const KV& kv) {
     std::fstream f;
     f.open(path, f.trunc | f.binary | f.out);
     if (!f.is_open()) {
-        throw SYSTEM_ERROR("snapshot");
+        throw SYSTEM_ERROR_MSG(path);
     } else {
         assert(s.size() <= std::numeric_limits<std::streamsize>::max());
         f.write(s.data(), static_cast<std::streamsize>(s.size()));
