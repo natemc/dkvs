@@ -6,8 +6,10 @@
 #include <fcntl.h>
 #include <fdcloser.h>
 #include <google/protobuf/stubs/common.h>
+#include <hashkv.h>
 #include <iostream>
 #include <pb.h>
+#include <system_error.h>
 #include <unistd.h>
 
 namespace {
@@ -61,9 +63,8 @@ int main(int argc, char* argv[]) {
             } else {
                 const char* const snapshot = argc == 1? "snapshot" : argv[1];
                 const FdCloser ss_closer(ss);
-                KV kv = load_snapshot(snapshot);
+                HashKV kv(snapshot);
                 server_repl(signal_pipe[0], ss, kv, pb_process_request);
-                save_snapshot(snapshot, kv);
             }
 
             std::cout << "bye!\n";

@@ -14,7 +14,7 @@ include(cmake/Sanitizers.cmake)
 enable_sanitizers(project_options)
 include(cmake/StaticAnalyzers.cmake)
 
-set(CORE src/command.cpp src/dkvs.cpp src/fdcloser.cpp
+set(CORE src/command.cpp src/dkvs.cpp src/fdcloser.cpp src/hashkv.cpp
          src/kv.cpp src/pb.cpp src/iouring.cpp)
 
 add_library(pb ${PROTO_SRCS})

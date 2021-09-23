@@ -1,16 +1,13 @@
 #include <dkvs.h>
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <charconv>
 #include <client_serdes.h>
 #include <command.h>
 #include <cstdio>
 #include <cstring>
-#include <doctest.h>
 #include <fcntl.h>
 #include <fdcloser.h>
-#include <fstream>
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
@@ -25,10 +22,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/types.h>
+#include <system_error.h>
 #include <tuple>
 #include <type_traits>
 #include <unistd.h>
@@ -38,53 +34,19 @@
 using namespace std::literals;
 
 namespace {
-    // All keys and values must be shorter than 128 bytes.
-    std::vector<char> serialize(const KV& kv) {
-        std::vector<char> r;
-        for (const auto& [k, v]: kv) {
-            assert(k.size() < 128);
-            assert(v.size() < 128);
-            const char klen = static_cast<char>(k.size());
-            const char vlen = static_cast<char>(v.size());
-            r.push_back(klen);
-            std::copy(k.begin(), k.end(), std::back_inserter(r));
-            r.push_back(vlen);
-            std::copy(v.begin(), v.end(), std::back_inserter(r));
-        }
-        return r;
-    }
-
-    KV deserialize(std::span<const char> s) {
-        KV kv;
-        for (auto it = s.begin(); it != s.end(); ) {
-            const char klen = *it++;
-            const std::string key(it, it + klen);
-            it += klen;
-            const char vlen = *it++;
-            kv[key] = std::string(it, it + vlen);
-            it += vlen;
-        }
-        return kv;
-    }
-
-    TEST_CASE("deserialize of serialize is identity") {
-        const KV kv{{"a"s, "A"s}, {"b"s, "B"s}, {"c"s, "C"s}};
-        CHECK(kv == deserialize(serialize(kv)));
-    }
-
     std::ostream& process_command(
         std::ostream& os, std::string_view command, KV& kv)
     {
         if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
             const std::string key(args);
-            const auto it = kv.find(key);
-            return it != kv.end()? os << it->second : os << key << " is not bound.";
+            const auto v = kv.get(key);
+            return v? os << *v : os << key << " is not bound.";
         } else if (cmd == Command::set) {
             if (const auto params = parse_set_args(args); params.empty()) {
                 return os << "Invalid command: " << command;
             } else {
                 for (const auto& [key, value]: params)
-                    kv[std::string(key)] = std::string(value);
+                    kv.set(std::string(key), std::string(value));
                 return os << "Done.";                
             }
         }
@@ -172,39 +134,6 @@ int server_socket(uint16_t port, int queue_depth) {
                 return closer.release();
             }
         }
-    }
-}
-
-KV load_snapshot(const char* path) {
-    const int fd = open(path, O_RDONLY);
-    if (fd < 0) return KV{};
-    const FdCloser closer(fd);
-    struct stat st;
-    if (const int rc = fstat(fd, &st); rc < 0) throw SYSTEM_ERROR(fstat);
-    assert(0 <= st.st_size);
-    const std::size_t sz = static_cast<std::size_t>(st.st_size);
-    constexpr off_t FROM_THE_BEGINNING = 0;
-    constexpr void* const WHEREVER = nullptr;
-    void * const m = mmap(WHEREVER, sz, PROT_READ,
-        MAP_POPULATE|MAP_PRIVATE, fd, FROM_THE_BEGINNING);
-    if (!m) throw SYSTEM_ERROR(mmap);
-    const auto r = deserialize(std::span{static_cast<const char*>(m), sz});
-    [[maybe_unused]] const int rc = munmap(m, sz);
-    assert(rc == 0);
-    return r;
-}
-
-void save_snapshot(const char* path, const KV& kv) {
-    const auto s = serialize(kv);
-    std::fstream f;
-    f.open(path, f.trunc | f.binary | f.out);
-    if (!f.is_open()) {
-        throw SYSTEM_ERROR_MSG(path);
-    } else {
-        assert(s.size() <= std::numeric_limits<std::streamsize>::max());
-        f.write(s.data(), static_cast<std::streamsize>(s.size()));
-        f.flush();
-        f.close();
     }
 }
 

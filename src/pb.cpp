@@ -118,8 +118,8 @@ int32_t pb_process_request(std::span<char> dest, std::string_view message, KV& k
     Response* const out = Arena::Create<Response>(&arena);
     switch (in->Command_case()) {
     case Request::CommandCase::kGet:
-        if (const auto it = kv.find(in->get().key()); it != kv.end()) {
-            out->mutable_got()->set_value(it->second);
+        if (const auto v = kv.get(in->get().key()); v) {
+            out->mutable_got()->set_value(*v);
         } else {
             std::ostringstream os;
             os << in->get().key() << " is not bound.";
@@ -131,7 +131,7 @@ int32_t pb_process_request(std::span<char> dest, std::string_view message, KV& k
         const int n = s.mapping_size();
         for (int i = 0; i < n; ++i) {
             const auto& m = s.mapping(i);
-            kv[m.key()] = m.value();
+            kv.set(m.key(), m.value()); // TODO multiset on KV
         }
         out->mutable_sot();
         break;
