@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-enum class Command { invalid, get, set };
+enum class Command { invalid, follow, get, set };
 
 std::pair<Command, std::string_view> which_command(std::string_view command);
 

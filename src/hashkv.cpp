@@ -119,11 +119,11 @@ namespace {
 
     UMSS load_snapshot(int fd) {
         assert(file_size(fd) >= sizeof HEADER);
-        const std::size_t     sz             = file_size(fd) - sizeof HEADER;
-        constexpr off_t       FROM_BEGINNING = 0;
-        constexpr void* const wherever       = nullptr;
+        const std::size_t     sz                 = file_size(fd) - sizeof HEADER;
+        constexpr off_t       FROM_THE_BEGINNING = 0;
+        constexpr void* const wherever           = nullptr;
         void * const m = mmap(wherever, sz, PROT_READ,
-            MAP_POPULATE|MAP_PRIVATE, fd, FROM_BEGINNING);
+            MAP_POPULATE|MAP_PRIVATE, fd, FROM_THE_BEGINNING);
         if (!m) throw SYSTEM_ERROR(mmap);
         std::span data{static_cast<const char*>(m) + sizeof HEADER, sz};
         const auto r = deserialize(data);

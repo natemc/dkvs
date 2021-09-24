@@ -19,11 +19,13 @@ namespace {
 } // namespace
 
 std::pair<Command, std::string_view> which_command(std::string_view command) {
-    // TODO we may have nullary commands someday, and they won't be
-    // followed by a space.
-#define COMMAND(X)                                         \
-    if (command.starts_with(#X " "))                       \
+#define NULLARY_COMMAND(X)                                  \
+    if (command.starts_with(#X))                            \
+        return {Command::X, command.substr(-1 + sizeof #X)}
+#define COMMAND(X)                                          \
+    if (command.starts_with(#X " "))                        \
         return {Command::X, command.substr(sizeof #X)}
+    COMMAND(follow);
     COMMAND(get);
     COMMAND(set);
 #undef COMMAND

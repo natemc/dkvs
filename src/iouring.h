@@ -33,25 +33,6 @@ struct IOURing {
     IOURing(const IOURing&) = delete;
     IOURing& operator=(const IOURing&) = delete;
 
-    // Cannot fail at runtime; errors are communicated via the cqe
-    // returned from wait.
-    template <class... O> void submit(const O&... ops) {
-        prep(ops...);
-        submit();
-    }
-    template <class... O> void submit(const Link<O...>& ops) {
-        prep(ops);
-        submit();
-    }
-
-    // Returns nullptr on SIGINT; throws on io uring errors.
-    // Check the res member of the returned cqe for operation-related errors.
-    io_uring_cqe* wait();
-    void seen(io_uring_cqe* cqe);
-
-private:
-    io_uring ring;
-
     template <class... O> void prep(const O&... ops) {
         (void)std::initializer_list<io_uring_sqe*>{prep(ops)...};
     }
@@ -64,13 +45,31 @@ private:
             (*i)->flags |= IOSQE_IO_LINK;
     }
 
+    // Cannot fail at runtime; errors are communicated via the cqe
+    // returned from wait.
+    template <class... O> void submit(const O&... ops) {
+        prep(ops...);
+        submit();
+    }
+    template <class... O> void submit(const Link<O...>& ops) {
+        prep(ops);
+        submit();
+    }
+    void submit();
+
+    // Returns nullptr on SIGINT; throws on io uring errors.
+    // Check the res member of the returned cqe for operation-related errors.
+    io_uring_cqe* wait();
+    void seen(io_uring_cqe* cqe);
+
+private:
+    io_uring ring;
+
     io_uring_sqe* prep(const Accept&);
     io_uring_sqe* prep(const Close&);
     io_uring_sqe* prep(const FSync&);
     io_uring_sqe* prep(const Read&);
     io_uring_sqe* prep(const Write&);
-
-    void submit();
 };
 
 inline std::system_error iouring_error(int code, const char* context) {
