@@ -1,6 +1,7 @@
 syntax = "proto3";
 option cc_enable_arenas = true;
 option optimize_for     = LITE_RUNTIME;
+package pb;
 
 message Follow  { uint64 seq = 1; }
 message Recap   { uint64 seq = 1; repeated Set set = 2; }
@@ -10,10 +11,3 @@ message Set     { repeated Mapping mapping = 1; }
 message Fail    { string message = 1; }
 message Got     { string value = 1; }
 message Sot     {}
-
-message Request  {
-    oneof Command { Get get = 1; Set set = 2; Follow follow = 3; }
-}
-message Response {
-    oneof Reply { Fail fail = 1; Got got = 2; Sot sot = 3; Recap recap = 4; }
-}

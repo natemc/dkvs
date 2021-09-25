@@ -64,7 +64,8 @@ int main(int argc, char* argv[]) {
                 const char* const snapshot = argc == 1? "snapshot" : argv[1];
                 const FdCloser ss_closer(ss);
                 HashKV kv(snapshot);
-                server_repl(signal_pipe[0], ss, kv, pb_process_request);
+                PbServerSerdes serdes;
+                server_repl(signal_pipe[0], ss, kv, serdes);
             }
 
             std::cout << "bye!\n";

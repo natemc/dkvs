@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <pb.h>
 #include <iouring.h>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -31,11 +32,12 @@
 #include <utility>
 #include <vector>
 
-using namespace std::literals;
-
 namespace {
+    using SV = std::string_view;
+    using namespace std::literals;
+
     std::ostream& process_command(
-        std::ostream& os, std::string_view command, KV& kv)
+        std::ostream& os, SV command, KV& kv)
     {
         if (const auto [cmd, args] = which_command(command); cmd == Command::get) {
             const std::string key(args);
@@ -51,15 +53,6 @@ namespace {
             }
         }
         return os << "Invalid command: " << command;
-    }
-
-    // Returns the length of the message or -1 if we need to wait for more data
-    int32_t whole_message(std::span<const char> data) {
-        if (data.size() < static_cast<std::size_t>(4)) return -1;
-        int32_t len;
-        memcpy(&len, data.data(), sizeof len); // TODO handle endianness
-        if (len <= 0) throw std::runtime_error("bad message");
-        return static_cast<std::size_t>(len) + 4 < data.size()? -1 : len;
     }
 
     struct Buffer {
@@ -164,14 +157,14 @@ void client_repl(int signal_pipe, int sock, ClientSerdes& serdes) {
         if (b == &sock_buf) {
             if (bytes_read < 0) throw IOURING_ERROR(bytes_read, server);
             sock_buf.p += bytes_read;
-            const auto len = whole_message(std::span{sock_buf.data, sock_buf.p});
+            const auto len = serdes.whole_message({sock_buf.data, sock_buf.p});
             if (len < 0) {
                 ring.submit(Read{
                     sock_buf.fd, sock_buf.p, sock_buf.space_left(), &sock_buf});
             } else {
                 // We don't expect multiple messages back at once
-                assert(len == sock_buf.p - (sock_buf.data + sizeof len));
-                std::string_view data{sock_buf.data + sizeof len, static_cast<std::size_t>(len)};
+                assert(len == sock_buf.p - sock_buf.data);
+                SV data{sock_buf.data, static_cast<std::size_t>(len)};
                 serdes.deserialize_response(std::cout, data) << '\n';
                 sock_buf.p = sock_buf.data;
                 ring.submit(Read{
@@ -191,17 +184,16 @@ void client_repl(int signal_pipe, int sock, ClientSerdes& serdes) {
                 ring.submit(Read{stdin_buf.fd, stdin_buf.p, stdin_buf.space_left(), &stdin_buf});
             } else {
                 stdin_buf.p = stdin_buf.data;
-                std::span<char> dest{sock_buf.data + sizeof(int32_t), sizeof sock_buf.data - 4};
-                std::string_view src{stdin_buf.data, nl};
+                std::span<char> dest{sock_buf.data};
+                SV src{stdin_buf.data, nl};
                 const int32_t len = serdes.serialize_request(dest, src);
                 if (len < 0) {
                     std::cerr << "Invalid command: " << src << "\n> ";
                     ring.submit(Read{stdin_buf.fd, stdin_buf.p, stdin_buf.space_left(), &stdin_buf});
                 } else {
-                    memcpy(sock_buf.data, &len, sizeof len); // TODO endianness
-                    const auto SZ = static_cast<std::size_t>(len) + sizeof len;
-                    assert(SZ < std::numeric_limits<unsigned int>::max());
-                    const auto sz = static_cast<unsigned int>(SZ);
+                    assert(static_cast<std::size_t>(len) <=
+                               std::numeric_limits<unsigned int>::max());
+                    const auto sz = static_cast<unsigned int>(len);
                     ring.submit(Link{Write(sock_buf.fd, sock_buf.data, sz, WRITE_COMPLETED),
                                      Read(sock_buf.fd, sock_buf.data, sizeof sock_buf.data, &sock_buf)});
                 }
@@ -210,9 +202,7 @@ void client_repl(int signal_pipe, int sock, ClientSerdes& serdes) {
     }
 }
 
-void server_repl(
-    int signal_pipe, int server_fd, KV& kv, process_request_t process_request)
-{
+void server_repl(int signal_pipe, int server_fd, KV& kv, ServerSerdes& serdes) {
     // TODO check isatty and handle differently if not?
     // Would be handy for testing if nothing else.
 
@@ -222,6 +212,7 @@ void server_repl(
     sockaddr_in6 client_addr = {};
     sockaddr* const addr = reinterpret_cast<sockaddr*>(&client_addr);
     socklen_t addr_len;
+    std::set<int> followers;
 
     // TODO Going beyond 4096 connections => multiple rings
     //          => multiple threads or spinning
@@ -267,8 +258,7 @@ void server_repl(
             char* const nl = std::find(b->p, b->p + bytes_read, '\n');
             if (nl != b->p + bytes_read) {
                 b->p = b->data;
-                std::string_view command{b->data, nl};
-                process_command(std::cout, command, kv);
+                process_command(std::cout, {b->data, nl}, kv);
                 std::cout << "\n> " << std::flush;
             } else {
                 b->p += bytes_read;
@@ -286,21 +276,52 @@ void server_repl(
                 ring.submit(Close(b->fd, CLOSE_COMPLETED));
                 delete b;
             }
-            const int32_t len = whole_message(std::span{b->data, b->p});
-            if (len < 0) {
+            const int32_t reqlen = serdes.whole_message({b->data, b->p});
+            if (reqlen < 0) {
                 ring.submit(Read{b->fd, b->p, b->space_left(), b});
             } else {
-                std::string_view request{b->data + sizeof len, static_cast<std::size_t>(len)};
-                std::span<char> dest{b->data + sizeof len, sizeof b->data - sizeof len};
-                const int32_t len = process_request(dest, request, kv);
+                SV request{b->data, static_cast<std::size_t>(reqlen)};
+                std::span<char> dest{b->data};
+                int32_t len = -1;
+                switch (serdes.request_type(request)) {
+                case Command::get:
+                    len = serdes.get(dest, request, [&](SV key) {
+                        return kv.get(key);
+                    });
+                    break;
+                case Command::set:
+                    len = serdes.set(dest, request,
+                        [&](const std::vector<std::pair<SV,SV>>& mappings) {
+                            for (auto& [key, value]: mappings) kv.set(key, value);
+                        });
+                    break;
+                case Command::follow:
+                    len = serdes.follow(request, [&](uint64_t /*seq*/) {
+/*                ReplicationBuffer* const r = new ReplicationBuffer;
+                r->p = r->data + (b->p - b->data);
+                memcpy(r->data, b->data, b->p - b->data);
+                // If we have a single sync follower, we want to link the
+                // write to that follower to its ack and then the ack to the
+                // client
+                for (int f: followers) {
+                    if (f != b->fd)
+                        ring.prep(Write{f, r->data, r->b - r->data, r});
+                }
+                ring.submit();*/
+                    });
+                    break;
+                default:
+                    break;
+                }
                 b->p = b->data;
                 if (len < 0) {
                     std::cerr << "Bad message";
+                } else if (len == 0) { // no response
+                    ring.submit(Read{b->fd, b->data, sizeof b->data, b});
                 } else {
-                    memcpy(b->data, &len, sizeof len); // TODO endianness
-                    const auto SZ = static_cast<std::size_t>(len) + sizeof len;
-                    assert(SZ < std::numeric_limits<unsigned int>::max());
-                    const auto sz = static_cast<unsigned int>(SZ);
+                    assert(static_cast<std::size_t>(len) <=
+                               std::numeric_limits<unsigned int>::max());
+                    const auto sz = static_cast<unsigned int>(len);
                     // TODO support multiple requests w/o round-trip on each
                     ring.submit(Link{Write(b->fd, b->data, sz, WRITE_COMPLETED),
                                      Read(b->fd, b->data, sizeof b->data, b)});
