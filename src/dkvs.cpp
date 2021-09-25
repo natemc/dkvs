@@ -17,7 +17,6 @@
 #include <netinet/in.h>
 #include <pb.h>
 #include <iouring.h>
-#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -29,6 +28,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unistd.h>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -212,7 +212,7 @@ void server_repl(int signal_pipe, int server_fd, KV& kv, ServerSerdes& serdes) {
     sockaddr_in6 client_addr = {};
     sockaddr* const addr = reinterpret_cast<sockaddr*>(&client_addr);
     socklen_t addr_len;
-    std::set<int> followers;
+    std::unordered_set<int> followers;
 
     // TODO Going beyond 4096 connections => multiple rings
     //          => multiple threads or spinning
@@ -233,7 +233,8 @@ void server_repl(int signal_pipe, int server_fd, KV& kv, ServerSerdes& serdes) {
             if (client_fd < 0) throw IOURING_ERROR(client_fd, accept);
             // TODO refuse connections if memory is low
             Buffer* const b = new Buffer(client_fd);
-            ring.submit(Read{b->fd, b->data, sizeof b->data, b});
+            ring.submit(Accept{server_fd, addr, &addr_len, CONNECTION_ACCEPTED},
+                        Read{b->fd, b->data, sizeof b->data, b});
             continue;
         }
         if (cqe->user_data == WRITE_COMPLETED) {
