@@ -152,14 +152,14 @@ HashKV::~HashKV() {
     close(fd);
 }
 
-std::optional<std::string> HashKV::get(const std::string& key) {
-    const auto it = m.find(key);
+std::optional<std::string> HashKV::get(SV key) {
+    const auto it = m.find(std::string(key));
     if (it == m.end()) return {};
     else               return {it->second};
 }
 
-void HashKV::set(const std::string& key, const std::string& value) {
+void HashKV::set(SV key, SV value) {
     const auto buf = serialize(key, value);
     write_or_die(fd, buf.data(), buf.size());
-    m[key] = value;
+    m[std::string(key)] = std::string(value);
 }
