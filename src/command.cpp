@@ -18,24 +18,24 @@ namespace {
     }
 } // namespace
 
-std::pair<Command, std::string_view> which_command(std::string_view command) {
+std::pair<Message, std::string_view> which_command(std::string_view command) {
 #define NULLARY_COMMAND(X)                                  \
     if (command.starts_with(#X))                            \
-        return {Command::X, command.substr(-1 + sizeof #X)}
+        return {Message::X, command.substr(-1 + sizeof #X)}
 #define COMMAND(X)                                          \
     if (command.starts_with(#X " "))                        \
-        return {Command::X, command.substr(sizeof #X)}
+        return {Message::X, command.substr(sizeof #X)}
     COMMAND(follow);
     COMMAND(get);
     COMMAND(set);
 #undef COMMAND
-    return {Command::invalid, command};
+    return {Message::invalid, command};
 }
 
 TEST_CASE("which_command recognizes get and set") {
-    CHECK(Command::get == which_command("get frobozz").first);
-    CHECK(Command::set == which_command("set xyzzy=47").first);
-    CHECK(Command::invalid == which_command("oops").first);
+    CHECK(Message::get == which_command("get frobozz").first);
+    CHECK(Message::set == which_command("set xyzzy=47").first);
+    CHECK(Message::invalid == which_command("oops").first);
 }
 
 std::vector<std::pair<std::string_view, std::string_view>>

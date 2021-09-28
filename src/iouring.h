@@ -9,6 +9,7 @@
 struct Accept { int fd; sockaddr* addr; socklen_t* addrlen; __u64 user_data; };
 struct Close { int fd; __u64 user_data; };
 struct FSync { int fd; };
+
 struct Read {
     template <class U>
         requires std::is_trivially_copyable_v<U> && (sizeof(U) <= sizeof(__u64))
@@ -21,7 +22,19 @@ struct Read {
     unsigned int sz;
     __u64 user_data;
 };
-struct Write { int fd; const void* buf; unsigned int sz; __u64 user_data; };
+
+struct Write {
+    template <class U>
+        requires std::is_trivially_copyable_v<U> && (sizeof(U) <= sizeof(__u64))
+    Write(int fd_, void* buf_, unsigned int  sz_, U user_data_):
+        fd(fd_), buf(buf_), sz(sz_), user_data(0)
+    { memcpy(&user_data, &user_data_, sizeof user_data_); }
+
+    int fd;
+    const void* buf;
+    unsigned int sz;
+    __u64 user_data;
+};
 
 template <class... O> using Link = std::tuple<O...>;
 
@@ -33,10 +46,15 @@ struct IOURing {
     IOURing(const IOURing&) = delete;
     IOURing& operator=(const IOURing&) = delete;
 
+    io_uring_sqe* prep(const Accept&);
+    io_uring_sqe* prep(const Close&);
+    io_uring_sqe* prep(const FSync&);
+    io_uring_sqe* prep(const Read&);
+    io_uring_sqe* prep(const Write&);
+
     template <class... O> void prep(const O&... ops) {
         (void)std::initializer_list<io_uring_sqe*>{prep(ops)...};
     }
-
     template <class... O> void prep(const Link<O...>& ops) {
         using SQEs = std::array<io_uring_sqe*, sizeof...(O)>;
         const auto f = [&](const auto&... op) { return SQEs{prep(op)...}; };
@@ -64,12 +82,6 @@ struct IOURing {
 
 private:
     io_uring ring;
-
-    io_uring_sqe* prep(const Accept&);
-    io_uring_sqe* prep(const Close&);
-    io_uring_sqe* prep(const FSync&);
-    io_uring_sqe* prep(const Read&);
-    io_uring_sqe* prep(const Write&);
 };
 
 inline std::system_error iouring_error(int code, const char* context) {

@@ -15,7 +15,7 @@ enable_sanitizers(project_options)
 include(cmake/StaticAnalyzers.cmake)
 
 set(CORE src/command.cpp src/dkvs.cpp src/fdcloser.cpp src/hashkv.cpp
-         src/kv.cpp src/pb.cpp src/iouring.cpp)
+         src/kv.cpp src/pb.cpp src/recap.cpp src/iouring.cpp)
 
 add_library(pb ${PROTO_SRCS})
 target_include_directories(pb PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
