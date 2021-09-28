@@ -122,9 +122,10 @@ namespace {
         const std::size_t     sz                 = file_size(fd) - sizeof HEADER;
         constexpr off_t       FROM_THE_BEGINNING = 0;
         constexpr void* const wherever           = nullptr;
+        if (sz == 0) return UMSS{}; // can't mmap 0 bytes
         void * const m = mmap(wherever, sz, PROT_READ,
             MAP_POPULATE|MAP_PRIVATE, fd, FROM_THE_BEGINNING);
-        if (!m) throw SYSTEM_ERROR(mmap);
+        if (m == MAP_FAILED) throw SYSTEM_ERROR(mmap);
         std::span data{static_cast<const char*>(m) + sizeof HEADER, sz};
         const auto r = deserialize(data);
         [[maybe_unused]] const int rc = munmap(m, sz);
@@ -152,14 +153,14 @@ HashKV::~HashKV() {
     close(fd);
 }
 
-std::optional<std::string> HashKV::get(const std::string& key) {
-    const auto it = m.find(key);
+std::optional<std::string> HashKV::get(SV key) {
+    const auto it = m.find(std::string(key));
     if (it == m.end()) return {};
     else               return {it->second};
 }
 
-void HashKV::set(const std::string& key, const std::string& value) {
+void HashKV::set(SV key, SV value) {
     const auto buf = serialize(key, value);
     write_or_die(fd, buf.data(), buf.size());
-    m[key] = value;
+    m[std::string(key)] = std::string(value);
 }

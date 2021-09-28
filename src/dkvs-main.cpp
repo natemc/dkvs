@@ -51,25 +51,32 @@ int main(int argc, char* argv[]) {
 
         struct sigaction sa = {};
         sa.sa_handler = signal_handler;
-        if (sigaction(SIGINT, &sa, nullptr) < 0) {
+        if (sigaction(SIGINT, &sa, nullptr) < 0)
             throw SYSTEM_ERROR(sigaction);
-        } else {
-            constexpr int PORT = 10010;
-            if (const int ss = server_socket(PORT); ss == -1) {
-                const int cs = client_socket("localhost", PORT);
-                const FdCloser cs_closer(cs);
-                PbClientSerdes serdes;
-                client_repl(signal_pipe[0], cs, serdes);
-            } else {
-                const char* const snapshot = argc == 1? "snapshot" : argv[1];
-                const FdCloser ss_closer(ss);
-                HashKV kv(snapshot);
-                server_repl(signal_pipe[0], ss, kv, pb_process_request);
-            }
 
-            std::cout << "bye!\n";
-            return EXIT_SUCCESS;
+        constexpr int LEADER_PORT = 10010;
+        if (argc == 1) { // client
+            const int cs = client_socket("localhost", LEADER_PORT);
+            const FdCloser cs_closer(cs);
+            PbClientSerdes serdes;
+            client_repl(signal_pipe[0], cs, serdes);
+        } else if (const int ls = server_socket(LEADER_PORT); ls == -1) { // follower
+            const char* const snapshot = argv[1];
+            HashKV kv(snapshot);
+            const int cs = client_socket("localhost", LEADER_PORT);
+            const FdCloser cs_closer(cs);
+            PbFollowerSerdes serdes;
+            follower_repl(signal_pipe[0], cs, kv, serdes);
+        } else {
+            const char* const snapshot = argv[1];
+            HashKV kv(snapshot);
+            const FdCloser ls_closer(ls);
+            PbServerSerdes serdes;
+            leader_repl(signal_pipe[0], ls, kv, serdes);
         }
+
+        std::cout << "bye!\n";
+        return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return EXIT_FAILURE;
